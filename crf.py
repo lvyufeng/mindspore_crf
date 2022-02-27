@@ -5,8 +5,16 @@ import mindspore.ops as ops
 import mindspore.numpy as mnp
 from mindspore import Parameter
 from mindspore.common.initializer import initializer, Uniform
-from mindspore.ops import constexpr
-                
+from mindspore._checkparam import Validator as validator
+from mindspore import ms_function
+
+
+def sequence_mask(seq_length, max_length):
+    """generate mask matrix by seq_length"""
+    range_vector = mnp.arange(0, max_length, 1, seq_length.dtype)
+    result = range_vector < seq_length.view(seq_length.shape + (1,))
+    return result.astype(mindspore.int64)
+
 class CRF(nn.Cell):
     """Conditional random field.
 
@@ -56,31 +64,20 @@ class CRF(nn.Cell):
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(num_tags={self.num_tags})'
 
-    def construct(self, emissions, tags, mask=None):
-        """Compute the conditional log likelihood of a sequence of tags given emission scores.
-
-        Args:
-            emissions (`Tensor`): Emission score tensor of size
-                ``(seq_length, batch_size, num_tags)`` if ``batch_first`` is ``False``,
-                ``(batch_size, seq_length, num_tags)`` otherwise.
-            tags (`LongTensor`): Sequence of tags tensor of size
-                ``(seq_length, batch_size)`` if ``batch_first`` is ``False``,
-                ``(batch_size, seq_length)`` otherwise.
-            mask (`ByteTensor`): Mask tensor of size ``(seq_length, batch_size)``
-                if ``batch_first`` is ``False``, ``(batch_size, seq_length)`` otherwise.
-
-        Returns:
-            `~torch.Tensor`: The log likelihood. This will have size ``(batch_size,)`` if
-            reduction is ``none``, ``()`` otherwise.
-        """
-        if mask is None:
-            mask = mnp.ones_like(tags, dtype=mindspore.int64)
+    def construct(self, emissions, tags, seq_length=None):
+        max_length = tags.shape[1] if self.batch_first else tags.shape[0]
 
         if self.batch_first:
             emissions = emissions.swapaxes(0, 1)
             tags = tags.swapaxes(0, 1)
-            mask = mask.swapaxes(0, 1)
 
+        if seq_length is None:
+            mask = mnp.ones_like(tags, dtype=mindspore.int64)
+        else:
+            mask = sequence_mask(seq_length, max_length)
+
+        if not self.batch_first:
+            mask = mask.swapaxes(0, 1)
         # shape: (batch_size,)
         numerator = self._compute_score(emissions, tags, mask)
         # shape: (batch_size,)
@@ -96,29 +93,29 @@ class CRF(nn.Cell):
             return llh.mean()
         return llh.sum() / mask.astype(emissions.dtype).sum()
 
-    # def decode(self, emissions: torch.Tensor,
-    #            mask: Optional[torch.ByteTensor] = None) -> List[List[int]]:
-    #     """Find the most likely tag sequence using Viterbi algorithm.
 
-    #     Args:
-    #         emissions (`~torch.Tensor`): Emission score tensor of size
-    #             ``(seq_length, batch_size, num_tags)`` if ``batch_first`` is ``False``,
-    #             ``(batch_size, seq_length, num_tags)`` otherwise.
-    #         mask (`~torch.ByteTensor`): Mask tensor of size ``(seq_length, batch_size)``
-    #             if ``batch_first`` is ``False``, ``(batch_size, seq_length)`` otherwise.
+    def decode(self, emissions, mask):
+        """Find the most likely tag sequence using Viterbi algorithm.
 
-    #     Returns:
-    #         List of list containing the best tag sequence for each batch.
-    #     """
-    #     self._validate(emissions, mask=mask)
-    #     if mask is None:
-    #         mask = emissions.new_ones(emissions.shape[:2], dtype=torch.uint8)
+        Args:
+            emissions (`~torch.Tensor`): Emission score tensor of size
+                ``(seq_length, batch_size, num_tags)`` if ``batch_first`` is ``False``,
+                ``(batch_size, seq_length, num_tags)`` otherwise.
+            mask (`~torch.ByteTensor`): Mask tensor of size ``(seq_length, batch_size)``
+                if ``batch_first`` is ``False``, ``(batch_size, seq_length)`` otherwise.
 
-    #     if self.batch_first:
-    #         emissions = emissions.transpose(0, 1)
-    #         mask = mask.transpose(0, 1)
+        Returns:
+            List of list containing the best tag sequence for each batch.
+        """
+        # self._validate(emissions, mask=mask)
+        if mask is None:
+            mask = mnp.ones(emissions.shape[:2], dtype=mindspore.int64)
 
-    #     return self._viterbi_decode(emissions, mask)
+        if self.batch_first:
+            emissions = emissions.swapaxes(0, 1)
+            mask = mask.swapaxes(0, 1)
+
+        return self._viterbi_decode(emissions, mask)
 
     def _compute_score(self, emissions, tags, mask):
         # emissions: (seq_length, batch_size, num_tags)
@@ -207,6 +204,7 @@ class CRF(nn.Cell):
         # shape: (batch_size,)
         return mnp.log(mnp.sum(mnp.exp(score), axis=1))
 
+    @ms_function
     def _viterbi_decode(self, emissions, mask):
         # emissions: (seq_length, batch_size, num_tags)
         # mask: (seq_length, batch_size)
@@ -220,7 +218,7 @@ class CRF(nn.Cell):
         # Start transition and first emission
         # shape: (batch_size, num_tags)
         score = self.start_transitions + emissions[0]
-        history = []
+        history = ()
 
         # score is a tensor of size (batch_size, num_tags) where for every batch,
         # value at column j stores the score of the best tag sequence so far that ends
@@ -247,13 +245,13 @@ class CRF(nn.Cell):
 
             # Find the maximum score over all possible current tag
             # shape: (batch_size, num_tags)
-            next_score, indices = next_score.max(axis=1)
-
+            indices = next_score.argmax(axis=1)
+            next_score = next_score.max(axis=1)
             # Set score to the next score if this timestep is valid (mask == 1)
             # and save the index that produces the next score
             # shape: (batch_size, num_tags)
-            score = mnp.where(mask[i].unsqueeze(1), next_score, score)
-            history.append(indices)
+            score = mnp.where(mask[i].expand_dims(1), next_score, score)
+            history += (indices,)
 
         # End transition score
         # shape: (batch_size, num_tags)
@@ -268,12 +266,12 @@ class CRF(nn.Cell):
         for idx in range(batch_size):
             # Find the tag which maximizes the score at the last timestep; this is our best tag
             # for the last timestep
-            _, best_last_tag = score[idx].max(axis=0)
+            best_last_tag = score[idx].argmax(axis=0)
             best_tags = [best_last_tag]
-
             # We trace back where the best last tag comes from, append that to our best tag
             # sequence, and trace it back again, and so on
             for hist in reversed(history[:seq_ends[idx]]):
+                # print(history[:seq_ends[idx]], hist)
                 best_last_tag = hist[idx][best_tags[-1]]
                 best_tags.append(best_last_tag)
 

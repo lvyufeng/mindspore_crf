@@ -8,13 +8,15 @@ import mindspore
 import mindspore.nn as nn
 import numpy as np
 import mindspore.ops as ops
-
-from crf import CRF
+from mindspore import context
+from crf import CRF, sequence_mask
 
 RANDOM_SEED = 1478754
 
 random.seed(RANDOM_SEED)
 mindspore.set_seed(RANDOM_SEED)
+
+context.set_context(mode=context.PYNATIVE_MODE)
 
 def compute_score(crf, emission, tag):
     # emission: (seq_length, num_tags)
@@ -92,21 +94,21 @@ class TestForward:
         # shape: (seq_length, batch_size)
         tags = make_tags(crf, seq_length, batch_size)
         # mask should have size of (seq_length, batch_size)
-        mask = mindspore.Tensor([[1, 1, 1], [1, 1, 0]], dtype=mindspore.int64).swapaxes(0, 1)
+        seq_length = mindspore.Tensor([3, 2], dtype=mindspore.int64)
 
         # shape: ()
-        llh = crf(emissions, tags, mask=mask)
+        llh = crf(emissions, tags, seq_length)
 
         # shape: (batch_size, seq_length, num_tags)
-        emissions = emissions.swapaxes(0, 1)
+        emissions_n = emissions.swapaxes(0, 1)
         # shape: (batch_size, seq_length)
-        tags = tags.swapaxes(0, 1)
+        tags_n = tags.swapaxes(0, 1)
         # shape: (batch_size, seq_length)
-        mask = mask.swapaxes(0, 1)
+        mask_n = sequence_mask(seq_length, 3)
 
         # Compute log likelihood manually
         manual_llh = 0.
-        for emission, tag, mask_ in zip(emissions, tags, mask):
+        for emission, tag, mask_ in zip(emissions_n, tags_n, mask_n):
             seq_len = mask_.sum()
             emission, tag = emission[:seq_len], tag[:seq_len]
             numerator = compute_score(crf, emission, tag).asnumpy()
@@ -120,7 +122,8 @@ class TestForward:
         assert llh.asnumpy() == approx(manual_llh)
         # ensure gradients can be computed
         grad_fn = ops.GradOperation(get_by_list=True)(crf, crf.trainable_params())
-        grad_fn(emissions, tags, mask)
+        print(seq_length.shape)
+        grad_fn(emissions, tags, seq_length)
 
     def test_works_without_mask(self):
         crf = make_crf()
@@ -343,33 +346,34 @@ class TestForward:
 #         assert 'invalid reduction: foo' in str(excinfo.value)
 
 
-# class TestDecode:
-#     def test_works_with_mask(self):
-#         crf = make_crf()
-#         seq_length, batch_size = 3, 2
+class TestDecode:
+    def test_works_with_mask(self):
+        crf = make_crf()
+        seq_length, batch_size = 3, 2
 
-#         # shape: (seq_length, batch_size, num_tags)
-#         emissions = make_emissions(crf, seq_length, batch_size)
-#         # mask should be (seq_length, batch_size)
-#         mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.uint8).transpose(0, 1)
+        # shape: (seq_length, batch_size, num_tags)
+        emissions = make_emissions(crf, seq_length, batch_size)
+        # mask should be (seq_length, batch_size)
+        mask = mindspore.Tensor([[1, 1, 1], [1, 1, 0]], dtype=mindspore.int64).swapaxes(0, 1)
 
-#         best_tags = crf.decode(emissions, mask=mask)
+        best_tags = crf.decode(emissions, mask)
 
-#         # shape: (batch_size, seq_length, num_tags)
-#         emissions = emissions.transpose(0, 1)
-#         # shape: (batch_size, seq_length)
-#         mask = mask.transpose(0, 1)
+        # shape: (batch_size, seq_length, num_tags)
+        emissions = emissions.swapaxes(0, 1)
+        # shape: (batch_size, seq_length)
+        mask = mask.swapaxes(0, 1)
 
-#         # Compute best tag manually
-#         for emission, best_tag, mask_ in zip(emissions, best_tags, mask):
-#             seq_len = mask_.sum()
-#             assert len(best_tag) == seq_len
-#             assert all(isinstance(t, int) for t in best_tag)
-#             emission = emission[:seq_len]
-#             manual_best_tag = max(
-#                 itertools.product(range(crf.num_tags), repeat=seq_len),
-#                 key=lambda t: compute_score(crf, emission, t))
-#             assert tuple(best_tag) == manual_best_tag
+        # Compute best tag manually
+        for emission, best_tag, mask_ in zip(emissions, best_tags, mask):
+            seq_len = mask_.sum()
+            assert len(best_tag) == seq_len
+            # assert all(isinstance(t, int) for t in best_tag)
+            emission = emission[:seq_len]
+            manual_best_tag = max(
+                itertools.product(range(crf.num_tags), repeat=seq_len),
+                key=lambda t: compute_score(crf, emission, t))
+
+            assert tuple(best_tag) == manual_best_tag
 
 #     def test_works_without_mask(self):
 #         crf = make_crf()
