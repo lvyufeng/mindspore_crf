@@ -11,12 +11,12 @@ import mindspore.ops as ops
 from mindspore import context
 from crf import CRF, sequence_mask
 
-RANDOM_SEED = 1478754
+RANDOM_SEED = 0
 
 random.seed(RANDOM_SEED)
 mindspore.set_seed(RANDOM_SEED)
 
-context.set_context(mode=context.PYNATIVE_MODE)
+context.set_context(mode=context.GRAPH_MODE)
 
 def compute_score(crf, emission, tag):
     # emission: (seq_length, num_tags)
@@ -104,14 +104,14 @@ class TestForward:
         # shape: (batch_size, seq_length)
         tags_n = tags.swapaxes(0, 1)
         # shape: (batch_size, seq_length)
-        mask_n = sequence_mask(seq_length, 3)
+        mask_n = sequence_mask(seq_length, 3, True)
 
         # Compute log likelihood manually
         manual_llh = 0.
         for emission, tag, mask_ in zip(emissions_n, tags_n, mask_n):
             seq_len = mask_.sum()
             emission, tag = emission[:seq_len], tag[:seq_len]
-            numerator = compute_score(crf, emission, tag).asnumpy()
+            numerator = compute_score(crf, emission, tag)
             all_scores = [
                 compute_score(crf, emission, t)
                 for t in itertools.product(range(crf.num_tags), repeat=seq_len)
@@ -119,10 +119,9 @@ class TestForward:
             denominator = math.log(sum(math.exp(s.asnumpy()) for s in all_scores))
             manual_llh += numerator - denominator
 
-        assert llh.asnumpy() == approx(manual_llh)
+        assert llh.asnumpy() == approx(manual_llh.asnumpy())
         # ensure gradients can be computed
         grad_fn = ops.GradOperation(get_by_list=True)(crf, crf.trainable_params())
-        print(seq_length.shape)
         grad_fn(emissions, tags, seq_length)
 
     def test_works_without_mask(self):
@@ -134,7 +133,7 @@ class TestForward:
 
         llh_no_mask = crf(emissions, tags)
         # No mask means the mask is all ones
-        llh_mask = crf(emissions, tags, mask=ops.ones_like(tags).astype(mindspore.int64))
+        llh_mask = crf(emissions, tags, seq_length=ops.fill(mindspore.int64, (tags.shape[1],), tags.shape[0]))
 
         assert llh_no_mask.asnumpy() == approx(llh_mask.asnumpy())
 
@@ -232,10 +231,10 @@ class TestForward:
         emissions = make_emissions(crf, seq_length, batch_size)
         # shape: (seq_length, batch_size)
         tags = make_tags(crf, seq_length, batch_size)
-        # mask should have size of (seq_length, batch_size)swapaxes
-        mask = mindspore.Tensor([[1, 1, 1], [1, 1, 0]], dtype=mindspore.int64).swapaxes(0, 1)
-
-        llh = crf(emissions, tags, mask=mask)
+        # seq_length should have size of (batch_size,)
+        seq_length = mindspore.Tensor([3, 2], dtype=mindspore.int64)
+    
+        llh = crf(emissions, tags, seq_length)
 
         assert llh.shape == ()
 
@@ -244,7 +243,7 @@ class TestForward:
         # shape: (batch_size, seq_length)
         tags = tags.swapaxes(0, 1)
         # shape: (batch_size, seq_length)
-        mask = mask.swapaxes(0, 1)
+        mask = sequence_mask(seq_length, tags.shape[1], True)
 
         # Compute log likelihood manually
         manual_llh, n_tokens = 0, 0
@@ -281,10 +280,10 @@ class TestForward:
         crf_bf.transitions.requires_grad = False
 
         # shape: (batch_size, seq_length, num_tags)
-        emissions = emissions.swapaxes(0, 1)
+        emissions_bf = emissions.swapaxes(0, 1)
         # shape: (batch_size, seq_length)
-        tags = tags.swapaxes(0, 1)
-        llh_bf = crf_bf(emissions, tags)
+        tags_bf = tags.swapaxes(0, 1)
+        llh_bf = crf_bf(emissions_bf, tags_bf)
 
         assert llh.asnumpy() == approx(llh_bf.asnumpy())
 
@@ -353,15 +352,15 @@ class TestDecode:
 
         # shape: (seq_length, batch_size, num_tags)
         emissions = make_emissions(crf, seq_length, batch_size)
-        # mask should be (seq_length, batch_size)
-        mask = mindspore.Tensor([[1, 1, 1], [1, 1, 0]], dtype=mindspore.int64).swapaxes(0, 1)
+        # seq_length should be (batch_size,)
+        seq_length = mindspore.Tensor([3, 2], mindspore.int64)
 
-        best_tags = crf.decode(emissions, mask)
-
+        score, history = crf(emissions, seq_length=seq_length)
+        best_tags = crf.post_decode(score, history, seq_length)
         # shape: (batch_size, seq_length, num_tags)
         emissions = emissions.swapaxes(0, 1)
         # shape: (batch_size, seq_length)
-        mask = mask.swapaxes(0, 1)
+        mask = sequence_mask(seq_length, emissions.shape[1])
 
         # Compute best tag manually
         for emission, best_tag, mask_ in zip(emissions, best_tags, mask):
